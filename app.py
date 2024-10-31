@@ -1,22 +1,19 @@
 import pandas as pd
 import numpy as np
-from dotenv import load_dotenv
-import os
-import requests
 import json
-from scipy import stats
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import PowerTransformer, RobustScaler
+from sklearn.decomposition import PCA
+import plotly.express as px
+import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
-from sklearn.preprocessing import PowerTransformer
-import streamlit as st
+from st_aggrid import AgGrid, GridOptionsBuilder
+from st_aggrid.shared import GridUpdateMode
 
-# Charger les données
+# Function to load data
 def load_data():
-    # Charger les données du fichier JSON (adapté à votre exemple)
+    # Load data from JSON files (adapt to your example)
     with open('./stock_data.json', 'r') as file:
         data_stock = json.load(file)
 
@@ -30,118 +27,178 @@ def load_data():
     df_opt.columns = df_opt.columns.map(lambda x: x.capitalize())
     df_opt.rename(columns={'Volume': 'Volume_option'}, inplace=True)
 
-    # Fusionner les données
+    # Merge data
     df_aapl = df_stock.merge(df_opt, on='Date', how='inner')
 
     numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume_stock', 'Strike', 'Last', 'Mark', 'Bid', 'Bid_size', 'Ask', 'Ask_size', 'Volume_option', 'Open_interest', 'Implied_volatility', 'Delta', 'Gamma', 'Theta', 'Vega', 'Rho']
     df_aapl[numeric_cols] = df_aapl[numeric_cols].astype(float)
     
-    df_aapl = df_aapl[~df_aapl.isnull().any(axis=1)]
+    df_aapl = df_aapl.dropna(subset=numeric_cols)
 
     return df_aapl
 
-# Fonction pour appliquer Box-Cox et calculer les outliers
-def boxcox_outliers(df, col):
-    # Vérifier s'il y a des valeurs négatives dans la colonne
-    if (df[col] < 0).any():
-        # Appliquer la transformation Yeo-Johnson (pour gérer les valeurs négatives)
-        pt = PowerTransformer(method='yeo-johnson')
-        df[f'boxcox_{col}'] = pt.fit_transform(df[[col]])
-        print(f'Utilisation de Yeo-Johnson pour la colonne {col}')
+# Function to normalize and scale data
+def normalize_scale(df, important_cols):
+    # Step 1: Identify skewed features
+    skewness = df[important_cols].skew()
+    skewed_features = skewness[abs(skewness) > 0.5].index
+
+    # Step 2: Apply transformations
+    positive_features = [col for col in skewed_features if (df[col] > 0).all()]
+    if positive_features:
+        pt_boxcox = PowerTransformer(method='box-cox')
+        df[positive_features] = pt_boxcox.fit_transform(df[positive_features])
+
+    other_features = list(set(skewed_features) - set(positive_features))
+    if other_features:
+        pt_yeojohnson = PowerTransformer(method='yeo-johnson')
+        df[other_features] = pt_yeojohnson.fit_transform(df[other_features])
+
+    # Step 3: Scale features
+    scaler = RobustScaler()
+    df[important_cols] = scaler.fit_transform(df[important_cols])
+
+    return df
+
+# Function to provide explanation for a specific contract
+def explain_contract(df, contract_id, important_cols):
+    # Get data for the contract
+    contract_data = df[df['Contractid'] == contract_id]
+
+    # Calculate deviations from the median
+    deviations = contract_data[important_cols] - df[important_cols].median()
+    deviations = deviations.T  # Transpose for easier handling
+    deviations.columns = ['Deviation']
+
+    # Calculate absolute deviations
+    deviations['Absolute Deviation'] = deviations['Deviation'].abs()
+
+    # Sort features by absolute deviation
+    deviations = deviations.sort_values(by='Absolute Deviation', ascending=False)
+
+    return deviations
+
+if __name__ == '__main__':
+
+    df_aapl = load_data()
+
+    # Define the features to use
+    important_cols = ['Strike', 'Last', 'Mark', 'Bid', 'Bid_size', 'Ask', 'Ask_size',
+                    'Volume_option', 'Open_interest', 'Implied_volatility', 'Delta',
+                    'Gamma', 'Theta', 'Vega', 'Rho']
+
+    st.title('Outlier Detection in Derivative Sensitivities')
+
+    # User selects the method
+    method = st.selectbox(
+        "Choose the outlier detection method:",
+        ["Statistical Method (IQR)", "Machine Learning Method (Isolation Forest)"]
+    )
+
+    df_aapl = normalize_scale(df_aapl, important_cols)
+
+    if method == "Statistical Method (IQR)":
+        # User sets IQR multiplier
+        iqr_multiplier_input = st.selectbox('Tolerance to outliers',
+                                            ['Low', 'Mid', 'High'])
+        map_iqr_multiplier = {'Low': 0.5, 'Mid': 1.5, 'High': 5}
+        iqr_multiplier = map_iqr_multiplier[iqr_multiplier_input]
+
+        # Compute bounds for each feature
+        df_aapl['Anomaly'] = 0  # Initialize as normal
+        for col in important_cols:
+            Q1 = df_aapl[col].quantile(0.25)
+            Q3 = df_aapl[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - iqr_multiplier * IQR
+            upper_bound = Q3 + iqr_multiplier * IQR
+            df_aapl.loc[(df_aapl[col] < lower_bound) | (df_aapl[col] > upper_bound), 'Anomaly'] = -1
+
     else:
-        # Appliquer la transformation Box-Cox à la colonne spécifiée
-        df[f'boxcox_{col}'], _ = stats.boxcox(df[col] + 1)  # Ajouter 1 pour éviter les zéros
-        print(f'Utilisation de Box-Cox pour la colonne {col}')
+        # Isolation Forest parameters
+        contamination_input = st.selectbox('Presence of outliers',
+                                           ['Unknown', 'Low', 'Mid', 'High'])
+        map_contamination = {'Unknown': 'auto', 'Low': 0.01, 'Mid': 0.1, 'High': 0.2}
+        contamination = map_contamination[contamination_input]
 
-    # Calculer l'IQR (Intervalle Interquartile) dans la colonne transformée
-    Q1 = df[f'boxcox_{col}'].quantile(0.25)
-    Q3 = df[f'boxcox_{col}'].quantile(0.75)
-    IQR = Q3 - Q1
+        model = IsolationForest(contamination=contamination, random_state=42)
+        X = df_aapl[important_cols]
+        model.fit(X)
+        df_aapl['Anomaly'] = model.predict(X)
 
-    # Identifier les outliers en dehors de l'intervalle [Q1 - 1.5*IQR, Q3 + 1.5*IQR]
-    outliers_iqr = df[(df[f'boxcox_{col}'] < (Q1 - 1.5 * IQR)) | 
-                      (df[f'boxcox_{col}'] > (Q3 + 1.5 * IQR))]
+    # Display outliers
+    outliers = df_aapl[df_aapl['Anomaly'] == -1]
+    if not outliers.empty:
+        st.subheader('Detected Outliers')
+        st.write(outliers)
+    else:
+        st.write("No outliers detected with the current parameters.")
 
-    # Identifier les données qui ne sont pas des outliers
-    not_outliers_iqr = df[~((df[f'boxcox_{col}'] < (Q1 - 1.5 * IQR)) | 
-                            (df[f'boxcox_{col}'] > (Q3 + 1.5 * IQR)))]
+    # Dimensionality Reduction and Visualization
+    st.subheader('Visualization of Contracts')
+    # Perform PCA or t-SNE
+    pca = PCA(n_components=2)
+    X_reduced = pca.fit_transform(df_aapl[important_cols])
+    plot_df = pd.DataFrame({
+        'Component 1': X_reduced[:, 0],
+        'Component 2': X_reduced[:, 1],
+        'Anomaly': df_aapl['Anomaly'],
+        'Contractid': df_aapl['Contractid']
+    })
+    # Map anomaly labels to colors
+    color_map = {1: 'normal', -1: 'anomaly', 0: 'normal'}
+    plot_df['Color'] = plot_df['Anomaly'].map(color_map)
 
-    # Retourner le DataFrame original avec la colonne transformée, les outliers et les non-outliers
-    return df, outliers_iqr, not_outliers_iqr
+    fig = px.scatter(
+        plot_df,
+        x='Component 1',
+        y='Component 2',
+        color='Color',
+        color_discrete_map={'normal': 'white', 'anomaly': 'blue'},
+        hover_data=['Contractid'],
+        title='Contracts Visualized with PCA'
+    )
+    fig.update_traces(marker=dict(size=7, line=dict(width=1, color='black')))
 
-def explanation(z_scores_df, col_selected):
-    # Trouver la ligne avec le Z-score le plus élevé en valeur absolue
-    max_zscore_row = z_scores_df.loc[z_scores_df['Absolute Z-Score'].idxmax()]
+    st.plotly_chart(fig)
 
-    # Afficher la feature avec le Z-score le plus élevé (en valeur absolue)
-    st.subheader(f"**Explication possible de l'outlier dans la cologne {col_selected}:**")
-    st.markdown(f"La plus grande différence observée concerne la variable **`{max_zscore_row['Feature']}`**.")
+    # Option to further analyze a specific feature
+    st.subheader('Further Analysis')
+    analyze_feature = st.checkbox('Do you want to further analyze a specific feature?')
+    if analyze_feature:
+        # User selects the feature
+        feature_selected = st.selectbox('Select a feature to analyze:', important_cols)
 
-    # Diviser la mise en page en trois colonnes
-    col1, col2, col3 = st.columns(3)
+        # Allow user to set thresholds using sliders
+        min_val = df_aapl[feature_selected].min()
+        max_val = df_aapl[feature_selected].max()
+        threshold = st.slider(f'Select threshold for {feature_selected}', min_val, max_val, (min_val, max_val))
+        df_filtered = df_aapl[(df_aapl[feature_selected] >= threshold[0]) & (df_aapl[feature_selected] <= threshold[1])]
+        st.write(f'Number of contracts within selected range: {len(df_filtered)}')
 
-    # Afficher les valeurs dans chaque colonne
-    with col1:
-        st.metric(label="Valeur Observée", value=round(max_zscore_row['Observed Value'], 2))
+        # Update KDE plot with shaded area
+        fig, ax = plt.subplots()
+        sns.kdeplot(df_aapl[feature_selected], shade=True, ax=ax)
+        ax.axvspan(threshold[0], threshold[1], color='red', alpha=0.3)
+        st.pyplot(fig)
 
-    with col2:
-        st.metric(label="Moyenne Historique", value=round(max_zscore_row['Mean'], 2))
+    # Option to delve into a specific contract
+    st.subheader('Contract Analysis')
+    analyze_contract = st.checkbox('Do you want to delve into a specific contract?')
+    if analyze_contract:
+        # User selects the contract
+        contract_ids = outliers['Contractid'].unique()
+        if len(contract_ids) == 0:
+            st.write("No outlier contracts to analyze.")
+        else:
+            contract_selected = st.selectbox('Select a contract to analyze:', contract_ids)
+            deviations = explain_contract(df_aapl, contract_selected, important_cols)
+            st.write(f'Analysis of Contract {contract_selected}')
+            st.write(deviations)
 
-    with col3:
-        st.metric(label="Z-Score", value=round(max_zscore_row['Z-Score'], 2))
-
-df_aapl = load_data()
-
-# Interface Streamlit
-st.title('Analyse des Outliers dans la Volatilité Implicite')
-
-important_cols = ['Strike','Last','Mark','Bid','Bid_size','Ask','Ask_size','Volume_option','Open_interest','Implied_volatility','Delta','Gamma','Theta','Vega','Rho']
-
-# Sélection de la métrique
-col_selected = st.selectbox("Sélectionnez la métrique pour analyser les outliers", important_cols)
-
-# Appliquer Box-Cox et obtenir les outliers
-df_transformed, outliers, not_outliers = boxcox_outliers(df_aapl, col_selected)
-
-if len(outliers) == 0: 
-    st.write(f"Il n'y a pas des outliers pour la métrique {col_selected}")
-
-else:
-    # Afficher les outliers
-    st.subheader(f'Outliers identifiés pour la métrique {col_selected}')
-    st.write(outliers)
-
-    # Sélection d'un contrat spécifique
-    contract_id_selected = st.selectbox("Sélectionnez le contrat à analyser", outliers['Contractid'].unique())
-
-    st.markdown(f"## Analyse de l'Outlier pour le Contrat `{contract_id_selected}`")
-
-    # Sélectionner les features numériques importantes pour l'analyse
-    X = df_aapl[df_aapl['Contractid'] != contract_id_selected][important_cols].drop(columns=col_selected)
-    y = df_aapl[df_aapl['Contractid'] != contract_id_selected][col_selected]
-
-    # Se concentrer sur le contrat spécifique
-    contract_data = df_aapl[df_aapl['Contractid'] == contract_id_selected]
-
-    # Prédire la volatilité implicite pour le contrat spécifique
-    X_contract = contract_data[important_cols].drop(columns=col_selected)
-    y_contract = contract_data[col_selected]
-
-    # Calculer la moyenne, l'écart-type et les Z-scores
-    mean_features = X.mean()
-    std_features = X.std()
-    z_scores = (X_contract.values[0] - mean_features) / std_features
-    z_scores_df = pd.DataFrame({'Feature': X_contract.columns, 'Z-Score': z_scores, 'Mean': mean_features, 'Observed Value': X_contract.iloc[0]})
-    z_scores_df['Absolute Z-Score'] = z_scores_df['Z-Score'].abs()
-
-    # Afficher les features les plus éloignées de la moyenne
-    st.subheader(f'Synthèse de la sensibilité pour le contrat')
-    st.write(z_scores_df.drop(columns='Feature').sort_values(by='Absolute Z-Score', ascending=False))
-
-    # Visualiser le Z-Score dans un graphique
-    plt.figure(figsize=(10, 6))
-    sns.barplot(x='Z-Score', y='Feature', data=z_scores_df.sort_values(by='Z-Score', ascending=False), palette='coolwarm')
-    plt.title(f'Métriques pour le Contrat {contract_id_selected}')
-    st.pyplot(plt)
-
-    explanation(z_scores_df, col_selected)
+            # Visualize deviations
+            fig, ax = plt.subplots(figsize=(10, 6))
+            deviations['Deviation'].plot(kind='bar', ax=ax)
+            ax.set_title(f'Deviations from Median for Contract {contract_selected}')
+            ax.set_ylabel('Deviation')
+            st.pyplot(fig)
