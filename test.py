@@ -52,38 +52,6 @@ numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume_stock',
 # Convertit les colonnes numériques sélectionnées en type float
 df_aapl[numeric_cols] = df_aapl[numeric_cols].astype(float)
 
-# %%
-def generate_stats(df, col):
-    # Réaliser le test de Shapiro-Wilk
-    stat, p_value = stats.shapiro(df[col])
-
-    print(f'Statistique: {stat}, p-value: {p_value}')
-
-    if p_value < 0.05:
-        print("Les données ne suivent pas une distribution normale (p < 0.05).")
-    else:
-        print("Les données suivent une distribution normale (p >= 0.05).")
-
-    # Tracer le Q-Q plot pour vérifier la normalité
-    stats.probplot(df[col], dist="norm", plot=plt)
-    plt.title('Q-Q Plot du Volume des Options')
-    plt.show()    
-
-    skewness = stats.skew(df[col])
-    kurt = stats.kurtosis(df[col])
-
-    print(f'Skewness: {skewness}')
-    print(f'Kurtosis: {kurt}')
-
-def histplot(df, col):
-    # Visualiser la nouvelle distribution
-    plt.figure(figsize=(10, 6))
-    sns.histplot(df[col], kde=True, bins=20)
-    plt.title('Distribution')
-    plt.xlabel('Volume')
-    plt.ylabel('Fréquence')
-    plt.show()
-
 def explanation(z_scores_df, contract_id):
     # Encontrar a linha com o maior Z-score em módulo
     max_zscore_row = z_scores_df.loc[z_scores_df['Absolute Z-Score'].idxmax()]
@@ -110,6 +78,8 @@ def boxcox_outliers(df, col):
     # Identificar os dados que não são outliers
     not_outliers_iqr = df[~((df[f'boxcox_{col}'] < (Q1 - 1.5 * IQR)) | 
                             (df[f'boxcox_{col}'] > (Q3 + 1.5 * IQR)))]
+    
+    print(outliers_iqr.columns)
 
     # Retornar o DataFrame original com a coluna transformada, os outliers e os não outliers
     return df, outliers_iqr, not_outliers_iqr
@@ -122,9 +92,7 @@ df_transformed, outliers, not_outliers = boxcox_outliers(df_aapl, 'Implied_volat
 outliers[['Expiration', 'Strike', 'Type', 'Last', 'Mark', 'Bid',
                 'Bid_size', 'Ask', 'Ask_size', 'Volume_option', 'Open_interest',
                 'Implied_volatility', 'Delta', 'Gamma', 'Theta', 'Vega', 'Rho',
-                f'boxcox_Implied_vol']]
-
-generate_stats(df_aapl, 'boxcox_Implied_vol')
+                'boxcox_Implied_volatility']]
 
 # %%
 important_cols = ['Strike','Last','Mark',
@@ -146,26 +114,6 @@ corr_matrix = df_aapl[important_cols].corr()
 corr_matrix_outliers = outliers[important_cols].corr()
 
 corr_matrix_not_outliers = not_outliers[important_cols].corr()
-
-# %%
-# Criar uma figura com subplots, 1 linha e 3 colunas
-fig, ax = plt.subplots(1, 3, figsize=(18, 6))
-
-# Heatmap da primeira matriz de correlação
-sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".1f", linewidths=0.5, square=True, ax=ax[0], cbar=False)
-ax[0].set_title('Matrice de Corrélation', fontsize=14)
-
-# Heatmap da segunda matriz de correlação (outliers)
-sns.heatmap(corr_matrix_outliers, annot=True, cmap='coolwarm', fmt=".1f", linewidths=0.5, square=True, ax=ax[1], cbar=False)
-ax[1].set_title('Matrice de Corrélation - Outliers', fontsize=14)
-
-# Heatmap da terceira matriz de correlação (não outliers)
-sns.heatmap(corr_matrix_not_outliers, annot=True, cmap='coolwarm', fmt=".1f", linewidths=0.5, square=True, ax=ax[2], cbar=False)
-ax[2].set_title('Matrice de Corrélation - Sans Outliers', fontsize=14)
-
-# Ajustar o layout
-plt.tight_layout()
-plt.show()
 
 # %%
 # Prever a volatilidade implícita para o contrato específico
@@ -194,13 +142,6 @@ z_scores_df = pd.DataFrame({'Z-Score': z_scores, 'Mean': mean_features, 'Observe
 z_scores_df['Absolute Z-Score'] = z_scores_df['Z-Score'].abs()
 
 z_scores_df = z_scores_df.sort_values(by='Absolute Z-Score', ascending=False)
-
-# %%
-# Visualizar os Z-Scores em um gráfico de barras
-plt.figure(figsize=(10, 6))
-sns.barplot(x='Z-Score', y='Feature', data=z_scores_df, palette='coolwarm')
-plt.title(f'Z-Scores para o Contrato {contract_id} (Distância em Desvios Padrões)')
-plt.show()
 
 # %%
 explanation(z_scores_df, contract_id)
